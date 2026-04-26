@@ -66,11 +66,11 @@ cmake --build build --config Release
 
 ## Основные файлы
 
-- [PList/src/app.cpp](<PList/src/app.cpp>)
-- [PList/src/database.cpp](<PList/src/database.cpp>)
-- [PList/src/database.hpp](<PList/src/database.hpp>)
-- [qwen/PList/CMakeLists.txt](<PList/CMakeLists.txt>)
-- [qwen/PList/plan.md](<PList/plan.md>)
+- [src/app.cpp](<src/app.cpp>)
+- [src/database.cpp](<src/database.cpp>)
+- [src/database.hpp](<src/database.hpp>)
+- [CMakeLists.txt](<CMakeLists.txt>)
+- [plan.md](<plan.md>)
 
 ## Ближайшие шаги
 
