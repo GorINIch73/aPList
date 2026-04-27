@@ -13,6 +13,11 @@
 #include <string>
 #include <cstdlib>
 #include <unordered_map>
+#include <vector>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #include "fuel_math.hpp"
 
@@ -21,16 +26,14 @@
 #include <windows.h>
 #endif
 
-#if WAYSHEET_ENABLE_IMGUI
 #include <GLFW/glfw3.h>
+#include "ImGuiFileDialog.h"
 #include "imgui.h"
 #include "backends/imgui_impl_glfw.h"
 #include "backends/imgui_impl_opengl3.h"
-#endif
 
 namespace waysheet {
 
-#if WAYSHEET_ENABLE_IMGUI
 namespace {
 
 static const ImWchar ICON_MIN_FA = 0xf000;
@@ -50,6 +53,7 @@ const char* kIconDelete = U8(u8"\uf1f8");
 const char* kIconOpen = U8(u8"\uf07b");
 const char* kIconSave = U8(u8"\uf0c7");
 const char* kIconClose = U8(u8"\uf011");
+const char* kIconSettings = U8(u8"\uf013");
 
 std::string gLoadedBaseFont;
 std::string gLoadedIconFont;
@@ -62,31 +66,28 @@ bool IconTextButton(const char* icon, const char* text, const char* id, const Im
   const std::string label = IconLabel(icon, text) + "##" + id;
   return ImGui::Button(label.c_str(), size);
 }
+ImVec4 HexToColor(const std::string& hex, float alpha = 1.0f) {
+  if (hex.size() != 7 || hex[0] != '#') return ImVec4(1.0f, 1.0f, 1.0f, alpha);
+  const auto readByte = [&](std::size_t pos) {
+    return static_cast<float>(std::stoi(hex.substr(pos, 2), nullptr, 16)) / 255.0f;
+  };
+  try {
+    return ImVec4(readByte(1), readByte(3), readByte(5), alpha);
+  } catch (...) {
+    return ImVec4(1.0f, 1.0f, 1.0f, alpha);
+  }
+}
 
+float Luminance(const ImVec4& color) {
+  return 0.2126f * color.x + 0.7152f * color.y + 0.0722f * color.z;
+}
+
+ImVec4 MixColor(const ImVec4& a, const ImVec4& b, float t, float alpha = 1.0f) {
+  return ImVec4(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t, alpha);
+}
 std::string PathToUtf8String(const std::filesystem::path& path) {
   const auto text = path.u8string();
   return std::string(reinterpret_cast<const char*>(text.c_str()), text.size());
-}
-
-std::string CsvEscape(std::string value) {
-  bool needsQuotes = false;
-  for (const char ch : value) {
-    if (ch == '"' || ch == ';' || ch == '\n' || ch == '\r') {
-      needsQuotes = true;
-      break;
-    }
-  }
-  if (!needsQuotes) return value;
-
-  std::string escaped;
-  escaped.reserve(value.size() + 2);
-  escaped.push_back('"');
-  for (const char ch : value) {
-    if (ch == '"') escaped.push_back('"');
-    escaped.push_back(ch);
-  }
-  escaped.push_back('"');
-  return escaped;
 }
 
 std::string HtmlEscape(const std::string& value) {
@@ -118,6 +119,21 @@ std::string FormatCsvNumber(double value, int precision) {
   std::ostringstream out;
   out << std::fixed << std::setprecision(precision) << value;
   return out.str();
+}
+
+void OpenDbFileDialog(const char* key, const char* title, const std::filesystem::path& initialPath,
+                      const std::string& defaultFileName = {}) {
+  IGFD::FileDialogConfig config;
+  const auto directory = initialPath.has_parent_path() ? initialPath.parent_path() : std::filesystem::current_path();
+  config.path = PathToUtf8String(directory);
+  config.countSelectionMax = 1;
+  config.flags = ImGuiFileDialogFlags_Modal;
+  if (!defaultFileName.empty()) {
+    config.fileName = defaultFileName;
+  } else if (initialPath.has_filename()) {
+    config.fileName = PathToUtf8String(initialPath.filename());
+  }
+  ImGuiFileDialog::Instance()->OpenDialog(key, title, ".db,.sqlite,.sqlite3", config);
 }
 
 std::string ShellQuote(const std::string& value) {
@@ -174,60 +190,6 @@ OpeningBalance FindOpeningBalance(const std::vector<Car>& cars, const std::vecto
     balance.fromPreviousWaybill = true;
   }
   return balance;
-}
-
-std::filesystem::path DefaultWaybillCsvPath(const std::string& dbPath) {
-  std::filesystem::path dir = std::filesystem::current_path();
-  std::string stem = "waybills";
-  if (!dbPath.empty()) {
-    const std::filesystem::path path(dbPath);
-    if (!path.parent_path().empty()) dir = path.parent_path();
-    if (!path.stem().empty()) stem = PathToUtf8String(path.stem());
-  }
-  return dir / (stem + "_waybills.csv");
-}
-
-bool ExportWaybillJournalCsv(const std::filesystem::path& path, const std::vector<WaybillEntry>& rows,
-                             const std::unordered_map<std::int64_t, std::string>& carNameById,
-                             const std::unordered_map<std::int64_t, std::string>& driverNameById,
-                             std::int64_t filterCarId, std::int64_t filterDriverId,
-                             const std::string& dateFrom, const std::string& dateTo, std::string& error) {
-  std::ofstream out(path, std::ios::binary);
-  if (!out) {
-    error = "Cannot open output file";
-    return false;
-  }
-
-  out << "\xEF\xBB\xBF";
-  out << "ID;Date;Car;Driver;Distance km;Odometer start;Odometer end;Fuel start l;Fuel added l;Fuel end l;"
-         "Norm fuel l;Actual fuel l;Variance l;Notes\n";
-
-  for (const auto& w : rows) {
-    if (filterCarId != 0 && w.car_id != filterCarId) continue;
-    if (filterDriverId != 0 && w.driver_id != filterDriverId) continue;
-    if (!dateFrom.empty() && w.date < dateFrom) continue;
-    if (!dateTo.empty() && w.date > dateTo) continue;
-
-    double distance = 0.0;
-    for (const auto& d : w.details) distance += d.distance_km;
-
-    const auto carIt = carNameById.find(w.car_id);
-    const auto driverIt = driverNameById.find(w.driver_id);
-    out << w.id << ';' << CsvEscape(w.date) << ';'
-        << CsvEscape(carIt != carNameById.end() ? carIt->second : "") << ';'
-        << CsvEscape(driverIt != driverNameById.end() ? driverIt->second : "") << ';'
-        << FormatCsvNumber(distance, 1) << ';' << FormatCsvNumber(w.odometer_start, 1) << ';'
-        << FormatCsvNumber(w.odometer_end, 1) << ';' << FormatCsvNumber(w.fuel_start_l, 2) << ';'
-        << FormatCsvNumber(w.fuel_added_l, 2) << ';' << FormatCsvNumber(w.fuel_end_l, 2) << ';'
-        << FormatCsvNumber(w.calculated_fuel_l, 2) << ';' << FormatCsvNumber(w.actual_fuel_l, 2) << ';'
-        << FormatCsvNumber(w.variance_l, 2) << ';' << CsvEscape(w.notes) << '\n';
-  }
-
-  if (!out) {
-    error = "Cannot write output file";
-    return false;
-  }
-  return true;
 }
 
 int ParseMonthFromDate(const char* date) {
@@ -292,19 +254,50 @@ void FormatIsoDate(int year, int month, int day, char* out, std::size_t outSize)
   std::snprintf(out, outSize, "%04d-%02d-%02d", year, month, day);
 }
 
-void LoadRussianAndIconFonts(ImGuiIO& io) {
+std::filesystem::path ExecutableDir() {
+#ifdef _WIN32
+  std::array<wchar_t, 4096> buffer{};
+  const DWORD size = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+  if (size > 0 && size < buffer.size()) {
+    return std::filesystem::path(std::wstring(buffer.data(), size)).parent_path();
+  }
+#else
+  std::array<char, 4096> buffer{};
+  const ssize_t size = readlink("/proc/self/exe", buffer.data(), buffer.size() - 1);
+  if (size > 0) {
+    buffer[static_cast<std::size_t>(size)] = '\0';
+    return std::filesystem::path(buffer.data()).parent_path();
+  }
+#endif
+  return std::filesystem::current_path();
+}
+
+std::vector<std::filesystem::path> FontCandidates(const std::string& filename) {
+  const std::filesystem::path exeDir = ExecutableDir();
+  return {
+      std::filesystem::path("fonts") / filename,
+      std::filesystem::path("..") / "fonts" / filename,
+      std::filesystem::path("..") / ".." / "fonts" / filename,
+      exeDir / "fonts" / filename,
+      exeDir / ".." / "share" / "aPList" / "fonts" / filename,
+      std::filesystem::path(WAYSHEET_INSTALL_FONT_DIR) / filename,
+  };
+}
+
+void LoadRussianAndIconFonts(ImGuiIO& io, float fontSize) {
+  io.Fonts->Clear();
   const ImWchar* cyrillicRanges = io.Fonts->GetGlyphRangesCyrillic();
 
-  const std::filesystem::path localFont = std::filesystem::path("fonts") / "NotoSans-Regular.ttf";
-  const std::filesystem::path localFontUp = std::filesystem::path("..") / "fonts" / "NotoSans-Regular.ttf";
-  const std::filesystem::path localFontUp2 = std::filesystem::path("..") / ".." / "fonts" / "NotoSans-Regular.ttf";
   const std::filesystem::path windowsSegoe = "C:/Windows/Fonts/segoeui.ttf";
   const std::filesystem::path windowsArial = "C:/Windows/Fonts/arial.ttf";
 
   ImFont* baseFont = nullptr;
-  for (const auto& path : {localFont, localFontUp, localFontUp2, windowsSegoe, windowsArial}) {
+  auto baseFontCandidates = FontCandidates("NotoSans-Regular.ttf");
+  baseFontCandidates.push_back(windowsSegoe);
+  baseFontCandidates.push_back(windowsArial);
+  for (const auto& path : baseFontCandidates) {
     if (!std::filesystem::exists(path)) continue;
-    baseFont = io.Fonts->AddFontFromFileTTF(path.string().c_str(), 18.0f, nullptr, cyrillicRanges);
+    baseFont = io.Fonts->AddFontFromFileTTF(path.string().c_str(), fontSize, nullptr, cyrillicRanges);
     if (baseFont) {
       gLoadedBaseFont = path.string();
       break;
@@ -319,18 +312,11 @@ void LoadRussianAndIconFonts(ImGuiIO& io) {
   ImFontConfig iconCfg{};
   iconCfg.MergeMode = true;
   iconCfg.PixelSnapH = true;
-  iconCfg.GlyphMinAdvanceX = 18.0f;
+  iconCfg.GlyphMinAdvanceX = fontSize;
 
-  const std::filesystem::path localFa6 = std::filesystem::path("fonts") / "fa-solid-900.ttf";
-  const std::filesystem::path localFa6Up = std::filesystem::path("..") / "fonts" / "fa-solid-900.ttf";
-  const std::filesystem::path localFa6Up2 = std::filesystem::path("..") / ".." / "fonts" / "fa-solid-900.ttf";
-  const std::filesystem::path localFa4 = std::filesystem::path("fonts") / "fontawesome-webfont.ttf";
-  const std::filesystem::path localFa4Up = std::filesystem::path("..") / "fonts" / "fontawesome-webfont.ttf";
-  const std::filesystem::path localFa4Up2 = std::filesystem::path("..") / ".." / "fonts" / "fontawesome-webfont.ttf";
-
-  for (const auto& path : {localFa6, localFa6Up, localFa6Up2, localFa4, localFa4Up, localFa4Up2}) {
+  for (const auto& path : FontCandidates("fa-solid-900.ttf")) {
     if (!std::filesystem::exists(path)) continue;
-    if (io.Fonts->AddFontFromFileTTF(path.string().c_str(), 18.0f, &iconCfg, ICON_RANGES_FA)) {
+    if (io.Fonts->AddFontFromFileTTF(path.string().c_str(), fontSize, &iconCfg, ICON_RANGES_FA)) {
       gLoadedIconFont = path.string();
       break;
     }
@@ -342,7 +328,6 @@ void LoadRussianAndIconFonts(ImGuiIO& io) {
 }
 
 }  // namespace
-#endif
 
 App::App() : dbPath_("waysheet.db") {
   const std::string defaultDb = dbPath_.string();
@@ -362,6 +347,7 @@ App::App() : dbPath_("waysheet.db") {
 }
 
 int App::run() {
+  loadUiSettings();
   loadRecentDbs();
   if (!initStorage()) {
     std::cerr << "Failed to initialize storage\n";
@@ -369,14 +355,7 @@ int App::run() {
   }
   seedDemoData();
 
-#if WAYSHEET_ENABLE_IMGUI
   return runGui();
-#else
-  showDashboardText();
-  std::cout << "Press Enter to exit...\n";
-  std::cin.get();
-  return 0;
-#endif
 }
 
 bool App::initStorage() {
@@ -397,12 +376,6 @@ void App::seedDemoData() {
   db_.addCar(Car{0, "A123BC77", "GAZelle NEXT", 80.0, 12500.0, 35.0, "2025-01-10", "active"});
   db_.addDriver(Driver{0, "Ivan Petrov", "+7-900-000-0000", "77 10 123456", "active"});
   db_.addRoute(Route{0, "Warehouse - City Center", 14.5, 16.2});
-}
-
-void App::showDashboardText() const {
-  std::cout << "Waysheet dashboard\n";
-  std::cout << "- DB: " << db_.currentPath() << "\n";
-  std::cout << "- Current theme: " << themes_.current().name << "\n";
 }
 
 void App::pushRecentDb(const std::string& path) {
@@ -426,6 +399,34 @@ void App::loadRecentDbs() {
 void App::saveRecentDbs() const {
   std::ofstream out(recentDbStore_, std::ios::trunc);
   for (const auto& path : recentDbs_) out << path << '\n';
+}
+
+void App::loadUiSettings() {
+  std::ifstream in(uiSettingsStore_);
+  std::string line;
+  while (std::getline(in, line)) {
+    const auto pos = line.find('=');
+    if (pos == std::string::npos) continue;
+    const std::string key = line.substr(0, pos);
+    const std::string value = line.substr(pos + 1);
+    if (key == "theme") {
+      themes_.setCurrent(value);
+    } else if (key == "font_size") {
+      try {
+        uiFontSize_ = std::stof(value);
+        if (uiFontSize_ < 15.0F) uiFontSize_ = 15.0F;
+        if (uiFontSize_ > 32.0F) uiFontSize_ = 32.0F;
+      } catch (...) {
+        uiFontSize_ = 18.0F;
+      }
+    }
+  }
+}
+
+void App::saveUiSettings() const {
+  std::ofstream out(uiSettingsStore_, std::ios::trunc);
+  out << "theme=" << themes_.current().name << '\n';
+  out << "font_size=" << std::fixed << std::setprecision(1) << uiFontSize_ << '\n';
 }
 
 bool App::createNewDatabase(const std::string& path) {
@@ -487,6 +488,42 @@ bool App::saveDatabaseAs(const std::string& path) {
     return false;
   }
   return openDatabase(target.string());
+}
+
+bool App::backupCurrentDatabase() {
+  if (!db_.isOpen()) {
+    uiStatus_ = "Ошибка бэкапа: база не открыта";
+    return false;
+  }
+
+  const std::filesystem::path source(db_.currentPath());
+  if (source.empty()) {
+    uiStatus_ = "Ошибка бэкапа: путь текущей базы пуст";
+    return false;
+  }
+
+  const std::time_t now = std::time(nullptr);
+  std::tm localTm{};
+#ifdef _WIN32
+  localtime_s(&localTm, &now);
+#else
+  localtime_r(&now, &localTm);
+#endif
+
+  char stamp[32]{};
+  std::snprintf(stamp, sizeof(stamp), "%04d%02d%02d_%02d%02d%02d", localTm.tm_year + 1900, localTm.tm_mon + 1,
+                localTm.tm_mday, localTm.tm_hour, localTm.tm_min, localTm.tm_sec);
+
+  std::filesystem::path target = source.parent_path() / (PathToUtf8String(source.stem()) + "_backup_" + stamp + source.extension().string());
+  std::error_code ec;
+  std::filesystem::copy_file(source, target, std::filesystem::copy_options::none, ec);
+  if (ec) {
+    uiStatus_ = "Ошибка бэкапа: " + ec.message();
+    return false;
+  }
+
+  uiStatus_ = "Бэкап создан: " + PathToUtf8String(target);
+  return true;
 }
 
 bool App::recalculateWaybillChainForCar(std::int64_t carId) {
@@ -660,8 +697,26 @@ bool App::exportMonthlyWaybillReportHtml(const std::string& month) {
   return true;
 }
 
-#if WAYSHEET_ENABLE_IMGUI
 void App::applyModernStyle() const {
+  const Theme& theme = themes_.current();
+  const ImVec4 background = HexToColor(theme.background);
+  const ImVec4 panel = HexToColor(theme.panel);
+  const ImVec4 accent = HexToColor(theme.accent);
+  const ImVec4 text = HexToColor(theme.text);
+  const ImVec4 mutedText(text.x, text.y, text.z, 0.68f);
+  const ImVec4 accentHover(std::min(accent.x + 0.08f, 1.0f), std::min(accent.y + 0.08f, 1.0f),
+                           std::min(accent.z + 0.08f, 1.0f), 1.0f);
+  const ImVec4 accentActive(std::max(accent.x - 0.08f, 0.0f), std::max(accent.y - 0.08f, 0.0f),
+                            std::max(accent.z - 0.08f, 0.0f), 1.0f);
+  const bool lightTheme = Luminance(background) > 0.55f;
+  const ImVec4 contrastBase = lightTheme ? ImVec4(0.0f, 0.0f, 0.0f, 1.0f) : ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+  const ImVec4 borderStrong = MixColor(panel, contrastBase, lightTheme ? 0.34f : 0.42f);
+  const ImVec4 borderSoft = MixColor(panel, contrastBase, lightTheme ? 0.20f : 0.26f);
+  const ImVec4 frameBg = MixColor(panel, lightTheme ? ImVec4(1.0f, 1.0f, 1.0f, 1.0f) : ImVec4(0.0f, 0.0f, 0.0f, 1.0f),
+                                  lightTheme ? 0.62f : 0.18f);
+  const ImVec4 tableHeader = MixColor(panel, accent, lightTheme ? 0.30f : 0.42f);
+  const ImVec4 tableRowAlt = MixColor(panel, contrastBase, lightTheme ? 0.045f : 0.070f);
+
   ImGuiStyle& style = ImGui::GetStyle();
   style.WindowRounding = 10.0f;
   style.ChildRounding = 8.0f;
@@ -673,22 +728,45 @@ void App::applyModernStyle() const {
   style.WindowPadding = ImVec2(14, 12);
   style.FramePadding = ImVec2(10, 6);
   style.ItemSpacing = ImVec2(9, 8);
+  style.FrameBorderSize = 1.0f;
+  style.ChildBorderSize = 1.0f;
+  style.PopupBorderSize = 1.0f;
 
   ImVec4* colors = style.Colors;
-  colors[ImGuiCol_WindowBg] = ImVec4(0.09f, 0.11f, 0.15f, 1.00f);
-  colors[ImGuiCol_ChildBg] = ImVec4(0.12f, 0.14f, 0.18f, 1.00f);
-  colors[ImGuiCol_Header] = ImVec4(0.20f, 0.30f, 0.44f, 0.95f);
-  colors[ImGuiCol_HeaderHovered] = ImVec4(0.26f, 0.38f, 0.56f, 1.00f);
-  colors[ImGuiCol_HeaderActive] = ImVec4(0.22f, 0.35f, 0.52f, 1.00f);
-  colors[ImGuiCol_Button] = ImVec4(0.21f, 0.33f, 0.49f, 0.95f);
-  colors[ImGuiCol_ButtonHovered] = ImVec4(0.27f, 0.41f, 0.62f, 1.00f);
-  colors[ImGuiCol_ButtonActive] = ImVec4(0.20f, 0.30f, 0.46f, 1.00f);
-  colors[ImGuiCol_Tab] = ImVec4(0.16f, 0.21f, 0.29f, 1.00f);
-  colors[ImGuiCol_TabHovered] = ImVec4(0.27f, 0.41f, 0.62f, 1.00f);
-  colors[ImGuiCol_TabSelected] = ImVec4(0.24f, 0.37f, 0.56f, 1.00f);
+  colors[ImGuiCol_Text] = text;
+  colors[ImGuiCol_TextDisabled] = mutedText;
+  colors[ImGuiCol_WindowBg] = background;
+  colors[ImGuiCol_ChildBg] = panel;
+  colors[ImGuiCol_PopupBg] = panel;
+  colors[ImGuiCol_Border] = borderStrong;
+  colors[ImGuiCol_BorderShadow] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+  colors[ImGuiCol_FrameBg] = frameBg;
+  colors[ImGuiCol_FrameBgHovered] = MixColor(frameBg, accent, 0.22f);
+  colors[ImGuiCol_FrameBgActive] = MixColor(frameBg, accent, 0.34f);
+  colors[ImGuiCol_Header] = tableHeader;
+  colors[ImGuiCol_HeaderHovered] = MixColor(tableHeader, accent, 0.32f);
+  colors[ImGuiCol_HeaderActive] = MixColor(tableHeader, accent, 0.46f);
+  colors[ImGuiCol_Button] = accent;
+  colors[ImGuiCol_ButtonHovered] = accentHover;
+  colors[ImGuiCol_ButtonActive] = accentActive;
+  colors[ImGuiCol_Tab] = ImVec4(panel.x, panel.y, panel.z, 1.00f);
+  colors[ImGuiCol_TabHovered] = accentHover;
+  colors[ImGuiCol_TabSelected] = accent;
+  colors[ImGuiCol_CheckMark] = accent;
+  colors[ImGuiCol_SliderGrab] = accent;
+  colors[ImGuiCol_SliderGrabActive] = accentHover;
+  colors[ImGuiCol_TableHeaderBg] = tableHeader;
+  colors[ImGuiCol_TableBorderStrong] = borderStrong;
+  colors[ImGuiCol_TableBorderLight] = borderSoft;
+  colors[ImGuiCol_TableRowBg] = panel;
+  colors[ImGuiCol_TableRowBgAlt] = tableRowAlt;
 }
 
 int App::runGui() {
+#if defined(GLFW_WAYLAND_LIBDECOR) && defined(GLFW_WAYLAND_DISABLE_LIBDECOR)
+  // Без этого на Wayland окно прыгало и не всегда срабатывала мышь.
+  glfwInitHint(GLFW_WAYLAND_LIBDECOR, GLFW_WAYLAND_DISABLE_LIBDECOR);
+#endif
   if (!glfwInit()) return 1;
   glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
   glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
@@ -706,7 +784,7 @@ int App::runGui() {
   ImGui::CreateContext();
   ImGuiIO& io = ImGui::GetIO();
   io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-  LoadRussianAndIconFonts(io);
+  LoadRussianAndIconFonts(io, uiFontSize_);
   applyModernStyle();
   ImGui_ImplGlfw_InitForOpenGL(window, true);
   ImGui_ImplOpenGL3_Init("#version 330");
@@ -718,6 +796,9 @@ int App::runGui() {
     ImGui::NewFrame();
 
     drawWorkspace();
+    if (closeRequested_) {
+      glfwSetWindowShouldClose(window, GLFW_TRUE);
+    }
 
     ImGui::Render();
     int w = 0, h = 0;
@@ -727,6 +808,13 @@ int App::runGui() {
     glClear(GL_COLOR_BUFFER_BIT);
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     glfwSwapBuffers(window);
+
+    if (rebuildFontsRequested_) {
+      rebuildFontsRequested_ = false;
+      ImGui_ImplOpenGL3_DestroyFontsTexture();
+      LoadRussianAndIconFonts(io, uiFontSize_);
+      ImGui_ImplOpenGL3_CreateFontsTexture();
+    }
   }
 
   ImGui_ImplOpenGL3_Shutdown();
@@ -759,41 +847,53 @@ void App::drawWorkspace() {
     const std::string tabDrivers = IconLabel(kIconDriver, "Водители");
     const std::string tabRoutes = IconLabel(kIconRoute, "Маршруты");
     const std::string tabWaybill = IconLabel(kIconWaybill, "Путевой лист");
-    const std::string tabDb = IconLabel(kIconDb, "База данных");
+    const std::string tabSettings = IconLabel(kIconSettings, "Настройки");
 
-    if (ImGui::BeginTabItem(tabDashboard.c_str(), nullptr, activeMainTab_ == 0 ? ImGuiTabItemFlags_SetSelected : 0)) {
+    const int requestedMainTab = requestedMainTab_;
+    auto tabFlags = [&](int tab) {
+      return requestedMainTab == tab ? ImGuiTabItemFlags_SetSelected : 0;
+    };
+
+    if (ImGui::BeginTabItem(tabDashboard.c_str(), nullptr, tabFlags(0))) {
       activeMainTab_ = 0;
+      if (requestedMainTab_ == 0) requestedMainTab_ = -1;
       drawDashboard();
       ImGui::EndTabItem();
     }
-    if (ImGui::BeginTabItem(tabWaybill.c_str(), nullptr, activeMainTab_ == 5 ? ImGuiTabItemFlags_SetSelected : 0)) {
+    if (ImGui::BeginTabItem(tabWaybill.c_str(), nullptr, tabFlags(5))) {
       activeMainTab_ = 5;
+      if (requestedMainTab_ == 5) requestedMainTab_ = -1;
       drawWaybillTab();
       ImGui::EndTabItem();
     }
-    if (ImGui::BeginTabItem(tabMonthly.c_str(), nullptr, activeMainTab_ == 6 ? ImGuiTabItemFlags_SetSelected : 0)) {
+    if (ImGui::BeginTabItem(tabMonthly.c_str(), nullptr, tabFlags(6))) {
       activeMainTab_ = 6;
+      if (requestedMainTab_ == 6) requestedMainTab_ = -1;
       drawMonthlySummaryTab();
       ImGui::EndTabItem();
     }
-    if (ImGui::BeginTabItem(tabCars.c_str(), nullptr, activeMainTab_ == 2 ? ImGuiTabItemFlags_SetSelected : 0)) {
+    if (ImGui::BeginTabItem(tabCars.c_str(), nullptr, tabFlags(2))) {
       activeMainTab_ = 2;
+      if (requestedMainTab_ == 2) requestedMainTab_ = -1;
       drawCarsTab();
       ImGui::EndTabItem();
     }
-    if (ImGui::BeginTabItem(tabDrivers.c_str(), nullptr, activeMainTab_ == 3 ? ImGuiTabItemFlags_SetSelected : 0)) {
+    if (ImGui::BeginTabItem(tabDrivers.c_str(), nullptr, tabFlags(3))) {
       activeMainTab_ = 3;
+      if (requestedMainTab_ == 3) requestedMainTab_ = -1;
       drawDriversTab();
       ImGui::EndTabItem();
     }
-    if (ImGui::BeginTabItem(tabRoutes.c_str(), nullptr, activeMainTab_ == 4 ? ImGuiTabItemFlags_SetSelected : 0)) {
+    if (ImGui::BeginTabItem(tabRoutes.c_str(), nullptr, tabFlags(4))) {
       activeMainTab_ = 4;
+      if (requestedMainTab_ == 4) requestedMainTab_ = -1;
       drawRoutesTab();
       ImGui::EndTabItem();
     }
-    if (ImGui::BeginTabItem(tabDb.c_str(), nullptr, activeMainTab_ == 1 ? ImGuiTabItemFlags_SetSelected : 0)) {
+    if (ImGui::BeginTabItem(tabSettings.c_str(), nullptr, tabFlags(1))) {
       activeMainTab_ = 1;
-      drawDbManagerWindow();
+      if (requestedMainTab_ == 1) requestedMainTab_ = -1;
+      drawSettingsTab();
       ImGui::EndTabItem();
     }
     ImGui::EndTabBar();
@@ -804,6 +904,8 @@ void App::drawWorkspace() {
     ImGui::TextWrapped("%s", uiStatus_.c_str());
   }
   ImGui::End();
+
+  handleDbFileDialogs();
 }
 
 void App::drawDashboard() {
@@ -882,15 +984,30 @@ void App::drawDashboard() {
   ImGui::Text("%s Быстрые действия", kIconDashboard);
   ImGui::Separator();
   const float actionW = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-  if (IconTextButton(kIconWaybill, "Листы", "dash_waybill", ImVec2(actionW, 28))) activeMainTab_ = 5;
+  if (IconTextButton(kIconWaybill, "Листы", "dash_waybill", ImVec2(actionW, 28))) {
+    requestedMainTab_ = 5;
+  }
   ImGui::SameLine();
-  if (IconTextButton(kIconSummary, "Итоги", "dash_monthly", ImVec2(actionW, 28))) activeMainTab_ = 6;
-  if (IconTextButton(kIconCar, "Авто", "dash_cars", ImVec2(actionW, 28))) activeMainTab_ = 2;
+  if (IconTextButton(kIconSummary, "Итоги", "dash_monthly", ImVec2(actionW, 28))) {
+    requestedMainTab_ = 6;
+  }
+  if (IconTextButton(kIconCar, "Авто", "dash_cars", ImVec2(actionW, 28))) {
+    requestedMainTab_ = 2;
+  }
   ImGui::SameLine();
-  if (IconTextButton(kIconDriver, "Водители", "dash_drivers", ImVec2(actionW, 28))) activeMainTab_ = 3;
-  if (IconTextButton(kIconRoute, "Маршруты", "dash_routes", ImVec2(actionW, 28))) activeMainTab_ = 4;
+  if (IconTextButton(kIconDriver, "Водители", "dash_drivers", ImVec2(actionW, 28))) {
+    requestedMainTab_ = 3;
+  }
+  if (IconTextButton(kIconRoute, "Маршруты", "dash_routes", ImVec2(actionW, 28))) {
+    requestedMainTab_ = 4;
+  }
   ImGui::SameLine();
-  if (IconTextButton(kIconDb, "БД", "dash_db", ImVec2(actionW, 28))) activeMainTab_ = 1;
+  if (IconTextButton(kIconSettings, "Настройки", "dash_settings", ImVec2(actionW, 28))) {
+    requestedMainTab_ = 1;
+  }
+  if (IconTextButton(kIconClose, "Выход", "dash_exit", ImVec2(actionW, 28))) {
+    closeRequested_ = true;
+  }
   ImGui::Separator();
   ImGui::Text("Авто: %lld", static_cast<long long>(db_.countRows("cars")));
   ImGui::Text("Водители: %lld", static_cast<long long>(db_.countRows("drivers")));
@@ -1309,25 +1426,79 @@ void App::drawMonthlySummaryTab() {
   ImGui::EndChild();
 }
 
-void App::drawDbManagerWindow() {
+void App::drawSettingsTab() {
   const ImVec2 avail = ImGui::GetContentRegionAvail();
   const float leftW = (avail.x * 0.64f > 520.0f) ? avail.x * 0.64f : 520.0f;
+  const std::filesystem::path currentDbPath = db_.isOpen() ? std::filesystem::path(db_.currentPath()) : dbPath_;
+  const std::filesystem::path dialogBasePath = currentDbPath.empty() ? std::filesystem::path("waysheet.db") : currentDbPath;
 
   ImGui::BeginChild("db_manager_left", ImVec2(leftW, 0), true);
-  ImGui::TextUnformatted("Операции с базой данных");
+  ImGui::TextUnformatted("Интерфейс");
+  ImGui::Separator();
+  const auto themeNames = [&]() {
+    auto names = themes_.names();
+    std::sort(names.begin(), names.end());
+    return names;
+  }();
+  if (ImGui::BeginCombo("Тема", themes_.current().name.c_str())) {
+    for (const auto& name : themeNames) {
+      const bool selected = name == themes_.current().name;
+      if (ImGui::Selectable(name.c_str(), selected)) {
+        themes_.setCurrent(name);
+        applyModernStyle();
+        saveUiSettings();
+        uiStatus_ = "Тема переключена: " + name;
+      }
+      if (selected) ImGui::SetItemDefaultFocus();
+    }
+    ImGui::EndCombo();
+  }
+  float requestedFontSize = uiFontSize_;
+  if (ImGui::SliderFloat("Размер шрифта", &requestedFontSize, 15.0f, 32.0f, "%.0f px")) {
+    if (requestedFontSize < 15.0f) requestedFontSize = 15.0f;
+    if (requestedFontSize > 32.0f) requestedFontSize = 32.0f;
+    if (std::abs(requestedFontSize - uiFontSize_) >= 0.5f) {
+      uiFontSize_ = requestedFontSize;
+      rebuildFontsRequested_ = true;
+      saveUiSettings();
+    }
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("18 px##font_size_reset")) {
+    if (std::abs(uiFontSize_ - 18.0F) >= 0.5f) {
+      uiFontSize_ = 18.0F;
+      rebuildFontsRequested_ = true;
+      saveUiSettings();
+    }
+  }
+  ImGui::Spacing();
+
+  ImGui::TextUnformatted("База данных");
   ImGui::Separator();
 
-  ImGui::InputText("Путь создания", dbCreatePath_.data(), dbCreatePath_.size());
-  ImGui::SameLine();
-  if (IconTextButton(kIconAdd, "Создать", "db_create", ImVec2(140, 0))) createNewDatabase(dbCreatePath_.data());
+  ImGui::TextWrapped("Текущая БД: %s", db_.isOpen() ? db_.currentPath().c_str() : "<закрыта>");
+  ImGui::Spacing();
 
-  ImGui::InputText("Путь открытия", dbOpenPath_.data(), dbOpenPath_.size());
+  if (IconTextButton(kIconAdd, "Создать новую БД", "db_create_dialog", ImVec2(220, 0))) {
+    OpenDbFileDialog("CreateDatabaseDialog", "Создать базу данных", dialogBasePath, "waysheet.db");
+  }
   ImGui::SameLine();
-  if (IconTextButton(kIconOpen, "Открыть", "db_open", ImVec2(140, 0))) openDatabase(dbOpenPath_.data());
+  if (IconTextButton(kIconOpen, "Открыть БД", "db_open_dialog", ImVec2(180, 0))) {
+    OpenDbFileDialog("OpenDatabaseDialog", "Открыть базу данных", dialogBasePath);
+  }
 
-  ImGui::InputText("Путь Сохранить как", dbSaveAsPath_.data(), dbSaveAsPath_.size());
+  if (IconTextButton(kIconSave, "Сохранить копию как", "db_saveas_dialog", ImVec2(220, 0))) {
+    if (db_.isOpen()) {
+      OpenDbFileDialog("SaveDatabaseAsDialog", "Сохранить копию базы данных", dialogBasePath,
+                       currentDbPath.has_filename() ? PathToUtf8String(currentDbPath.filename()) : "waysheet.db");
+    } else {
+      uiStatus_ = "Ошибка \"Сохранить как\": база не открыта";
+    }
+  }
   ImGui::SameLine();
-  if (IconTextButton(kIconSave, "Сохранить как", "db_saveas", ImVec2(160, 0))) saveDatabaseAs(dbSaveAsPath_.data());
+  if (IconTextButton(kIconSave, "Бэкап", "db_backup", ImVec2(120, 0))) {
+    backupCurrentDatabase();
+  }
 
   if (IconTextButton(kIconClose, "Закрыть текущую БД", "db_close", ImVec2(220, 0))) {
     db_.close();
@@ -1350,6 +1521,28 @@ void App::drawDbManagerWindow() {
   ImGui::Text("Водители: %lld", static_cast<long long>(db_.countRows("drivers")));
   ImGui::Text("Маршруты: %lld", static_cast<long long>(db_.countRows("routes")));
   ImGui::EndChild();
+}
+
+void App::handleDbFileDialogs() {
+  const ImVec2 dialogSize(760.0f, 460.0f);
+  if (ImGuiFileDialog::Instance()->Display("CreateDatabaseDialog", ImGuiWindowFlags_NoCollapse, dialogSize)) {
+    if (ImGuiFileDialog::Instance()->IsOk()) {
+      createNewDatabase(ImGuiFileDialog::Instance()->GetFilePathName());
+    }
+    ImGuiFileDialog::Instance()->Close();
+  }
+  if (ImGuiFileDialog::Instance()->Display("OpenDatabaseDialog", ImGuiWindowFlags_NoCollapse, dialogSize)) {
+    if (ImGuiFileDialog::Instance()->IsOk()) {
+      openDatabase(ImGuiFileDialog::Instance()->GetFilePathName());
+    }
+    ImGuiFileDialog::Instance()->Close();
+  }
+  if (ImGuiFileDialog::Instance()->Display("SaveDatabaseAsDialog", ImGuiWindowFlags_NoCollapse, dialogSize)) {
+    if (ImGuiFileDialog::Instance()->IsOk()) {
+      saveDatabaseAs(ImGuiFileDialog::Instance()->GetFilePathName());
+    }
+    ImGuiFileDialog::Instance()->Close();
+  }
 }
 
 void App::drawCarsTab() {
@@ -1402,11 +1595,6 @@ void App::drawCarsTab() {
         uiStatus_ = "Ошибка удаления авто: " + db_.lastError();
       }
     }
-    ImGui::SameLine();
-    if (IconTextButton(kIconWaybill, "Печать", "car_toolbar_print_v3", ImVec2(110, 0))) {
-      uiStatus_ = "Печать для раздела 'Автомобили' будет добавлена";
-    }
-
     ImGui::Separator();
     ImGui::InputText("Фильтр по номеру", plateFilter.data(), plateFilter.size());
 
@@ -1604,11 +1792,6 @@ void App::drawCarsTab() {
         uiStatus_ = "Карточка загружена в редактор";
       }
     }
-    ImGui::SameLine();
-    if (IconTextButton(kIconWaybill, "Печать", "car_toolbar_print_v2", ImVec2(110, 0))) {
-      uiStatus_ = "Печать для раздела 'Автомобили' будет добавлена";
-    }
-
     ImGui::Separator();
     ImGui::InputText("Фильтр по номеру", plateFilter.data(), plateFilter.size());
 
@@ -1913,11 +2096,6 @@ void App::drawDriversTab() {
         uiStatus_ = "Ошибка удаления водителя: " + db_.lastError();
       }
     }
-    ImGui::SameLine();
-    if (IconTextButton(kIconWaybill, "Печать", "driver_toolbar_print_v3", ImVec2(110, 0))) {
-      uiStatus_ = "Печать для раздела 'Водители' будет добавлена";
-    }
-
     ImGui::Separator();
     ImGui::InputText("Фильтр по ФИО", nameFilter.data(), nameFilter.size());
 
@@ -2039,11 +2217,6 @@ void App::drawDriversTab() {
         uiStatus_ = "Карточка водителя загружена в редактор";
       }
     }
-    ImGui::SameLine();
-    if (IconTextButton(kIconWaybill, "Печать", "driver_toolbar_print_v2", ImVec2(110, 0))) {
-      uiStatus_ = "Печать для раздела 'Водители' будет добавлена";
-    }
-
     ImGui::Separator();
     ImGui::InputText("Фильтр по ФИО", nameFilter.data(), nameFilter.size());
 
@@ -2335,11 +2508,6 @@ void App::drawRoutesTab() {
         uiStatus_ = "Ошибка удаления маршрута: " + db_.lastError();
       }
     }
-    ImGui::SameLine();
-    if (IconTextButton(kIconWaybill, "Печать", "route_toolbar_print_v3", ImVec2(110, 0))) {
-      uiStatus_ = "Печать для раздела 'Маршруты' будет добавлена";
-    }
-
     ImGui::Separator();
     ImGui::InputText("Фильтр по названию", nameFilter.data(), nameFilter.size());
 
@@ -2446,11 +2614,6 @@ void App::drawRoutesTab() {
         uiStatus_ = "Карточка маршрута загружена в редактор";
       }
     }
-    ImGui::SameLine();
-    if (IconTextButton(kIconWaybill, "Печать", "route_toolbar_print_v2", ImVec2(110, 0))) {
-      uiStatus_ = "Печать для раздела 'Маршруты' будет добавлена";
-    }
-
     ImGui::Separator();
     ImGui::InputText("Фильтр по названию", nameFilter.data(), nameFilter.size());
 
@@ -2840,25 +3003,6 @@ void App::drawWaybillTab() {
         uiStatus_ = "Ошибка удаления путевого листа: " + db_.lastError();
       }
     }
-    ImGui::SameLine();
-    if (IconTextButton(kIconWaybill, "Печать", "wb_toolbar_print_v3", ImVec2(110, 0))) {
-      uiStatus_ = "Печать для раздела 'Путевые листы' будет добавлена";
-    }
-
-      ImGui::SameLine();
-    if (IconTextButton(kIconSave, U8(u8"Экспорт CSV"), "wb_toolbar_export_csv_v3", ImVec2(160, 0))) {
-      const auto exportRows = db_.listWaybills();
-      const auto outPath = DefaultWaybillCsvPath(db_.currentPath());
-      std::string error;
-      if (ExportWaybillJournalCsv(outPath, exportRows, carNameById, driverNameById, waybillForm_.filterCarId,
-                                  waybillForm_.filterDriverId, waybillForm_.filterDateFrom.data(),
-                                  waybillForm_.filterDateTo.data(), error)) {
-        uiStatus_ = std::string(U8(u8"CSV экспортирован: ")) + PathToUtf8String(outPath);
-      } else {
-        uiStatus_ = std::string(U8(u8"Ошибка экспорта CSV: ")) + error;
-      }
-    }
-
     ImGui::Separator();
     ImGui::InputText("С даты", waybillForm_.filterDateFrom.data(), waybillForm_.filterDateFrom.size());
     ImGui::SameLine();
@@ -3579,6 +3723,5 @@ void App::drawWaybillTab() {
 
   ImGui::EndChild();
 }
-#endif
 
 }  // namespace waysheet

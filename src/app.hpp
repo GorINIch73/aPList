@@ -18,13 +18,13 @@ class App {
  private:
   bool initStorage();
   void seedDemoData();
-  void showDashboardText() const;
   int runGui();
   void applyModernStyle() const;
   void drawWorkspace();
   void drawDashboard();
   void drawMonthlySummaryTab();
-  void drawDbManagerWindow();
+  void drawSettingsTab();
+  void handleDbFileDialogs();
   void drawCarsTab();
   void drawDriversTab();
   void drawRoutesTab();
@@ -32,9 +32,12 @@ class App {
   void pushRecentDb(const std::string& path);
   void loadRecentDbs();
   void saveRecentDbs() const;
+  void loadUiSettings();
+  void saveUiSettings() const;
   bool createNewDatabase(const std::string& path);
   bool openDatabase(const std::string& path);
   bool saveDatabaseAs(const std::string& path);
+  bool backupCurrentDatabase();
   bool recalculateWaybillChainForCar(std::int64_t carId);
   bool exportMonthlyWaybillReportHtml(const std::string& month);
 
@@ -48,8 +51,13 @@ class App {
   std::array<char, 512> dbSaveAsPath_{};
   std::string uiStatus_;
   int activeMainTab_{0};
+  int requestedMainTab_{-1};
+  float uiFontSize_{18.0F};
+  bool rebuildFontsRequested_{false};
+  bool closeRequested_{false};
   std::vector<std::string> recentDbs_;
   std::filesystem::path recentDbStore_{"recent_dbs.txt"};
+  std::filesystem::path uiSettingsStore_{"ui_settings.ini"};
 
   struct CarFormState {
     std::array<char, 64> plate{};

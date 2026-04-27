@@ -1,5 +1,6 @@
 # Build output
 build/
+build*/
 
 # IDE
 *.sln
@@ -9,6 +10,11 @@ build/
 
 # ImGui
 imgui.ini
+
+# Runtime local data
+*.db
+recent_dbs.txt
+ui_settings.ini
 
 # CMake
 CMakeCache.txt

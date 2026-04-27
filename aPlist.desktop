@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=aPList
+Comment=Waysheet accounting desktop application
+Exec=waysheet
+Icon=aPlist
+Terminal=false
+Categories=Office;Database;
+StartupNotify=true
